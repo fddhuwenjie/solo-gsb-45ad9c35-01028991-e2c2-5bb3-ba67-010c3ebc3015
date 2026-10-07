@@ -18,7 +18,11 @@
 领取的累计秒数（必须与进度精确相等，否则 **409** 且状态不变）与目标
 `小节:拍:tick`，尚未发放且位于目标之前的提示记为**跳过**（目标处
 提示可在同一秒领取，回跳不重发、不恢复），此后提示按“提交秒数 +
-目标到提示的速度图时长”定时；发布后待发提示按最新修订重新计时，
+目标到提示的速度图时长”定时；定位响应在原有字段之外返回**操作 ID**，
+误定位后可凭它**撤销尚未继续使用的最近一次定位**：只恢复该次定位前的
+计时起点与该次跳过的待发提示（连续定位只能撤销最后一次，普通回跳不
+恢复旧提示）；定位后只要进度前进、提示发放、登记批注或速度图发布，
+撤销即 **409** 且状态不变；发布后待发提示按最新修订重新计时，
 而已发记录、跳过状态与定位起点不变。排练、发放与跳过记录同样保存在
 SQLite，重启后可继续领取。
 
@@ -79,6 +83,7 @@ docker compose up --build
 - 创建排练：`POST http://localhost:8000/rehearsals`
 - 领取到点提示：`POST http://localhost:8000/rehearsals/{id}/claims`
 - 定位（跳转）：`POST http://localhost:8000/rehearsals/{id}/locate`
+- 撤销定位：`POST http://localhost:8000/rehearsals/{id}/locates/{operation_id}/undo`
 - 登记批注：`POST http://localhost:8000/rehearsals/{id}/annotations`
 - 查询批注：`GET  http://localhost:8000/rehearsals/{id}/annotations`
 - 查询排练：`GET  http://localhost:8000/rehearsals/{id}`
@@ -351,19 +356,38 @@ curl -s http://localhost:8000/scores/$SID
      目标之前的待发提示（若有）同样记为跳过；
    - 定位的读-判-写在**单个写事务**内完成，与领取、发布共用写锁
      串行化：同一条提示不可能既跳过又发放，跳过记录的修订必然是
-     定位瞬间谱例的当前修订。
-6. **发布与定位的关系**：速度图发布后，**待发提示按最新已提交修订
+     定位瞬间谱例的当前修订；
+   - 定位响应在原有字段之外新增 **`operation_id`**（其余字段保持
+     不变），作为撤销该次定位的凭据。
+6. **撤销定位** `POST /rehearsals/{id}/locates/{operation_id}/undo`
+   （无请求体）：误定位后可撤销**尚未继续使用的最近一次定位**。
+   - 只恢复该操作保存的**定位前计时起点**，并把**该次定位新跳过**的
+     提示恢复为**待发**；更早已发放或已跳过的提示**保持原状**，领取
+     进度不回退。恢复后待发提示按**恢复的起点**与谱例**当前已提交
+     速度图**定时（下一次领取时计算），查询与重启后的状态一致；
+   - 只能撤销该排练**最后一次未撤销定位**：操作 ID 已撤销（重复撤销）
+     或其后又定位过（连续定位只能撤销最后一次）返回 **409**；普通
+     回跳若需还原应撤销回跳本身，服务端不会因回跳恢复更早的旧提示；
+   - 定位之后只要发生以下任一“继续使用”，操作即过期，撤销返回
+     **409 且状态完全不变**：领取**进度前进**（同秒重复领取但无新发放
+     不算）、有提示**发放**、登记了**批注**、谱例速度图**发布**；
+   - 操作 ID 不存在（或不属于该排练）返回 **404**，排练不存在返回
+     **404**。操作 ID 匹配、状态检查与提示恢复在**同一写事务**的同一
+     已提交快照内完成，与领取、批注登记、定位或发布交错时不会出现
+     跨快照的部分恢复。
+7. **发布与定位的关系**：速度图发布后，**待发提示按最新已提交修订
    重新计时**（起点 tick 到提示 tick 的速度图时长随新图变化）；
    **已发记录、跳过状态与定位起点（tick/提交秒数）都不变**。
-7. **查询** `GET /rehearsals/{id}`：返回已领取进度、当前计时起点
+8. **查询** `GET /rehearsals/{id}`：返回已领取进度、当前计时起点
    `origin`（位置/tick/累计秒数）与每条提示的状态
    `status`（`pending` 待发 / `delivered` 已发 / `skipped` 跳过；
    同时保留兼容字段 `delivered`、已发提示的 `trigger_seconds` /
    `revision`，以及跳过提示的 `skipped_revision`）。
-8. 排练、提示、发放与跳过记录保存在 **SQLite**（`rehearsals` /
-   `rehearsal_cues` / `cue_deliveries` / `cue_skips` 表，与谱例同库同卷；
-   旧库打开时自动补定位起点列），Compose 重启后可继续领取。批注见
-   `rehearsal_annotations` 表（下一节）。
+9. 排练、提示、发放、跳过记录与定位操作历史保存在 **SQLite**
+   （`rehearsals` / `rehearsal_cues` / `cue_deliveries` / `cue_skips` /
+   `locate_operations` / `locate_operation_skips` 表，与谱例同库同卷；
+   旧库打开时自动补定位起点列并新建定位操作表），Compose 重启后可
+   继续领取与撤销。批注见 `rehearsal_annotations` 表（下一节）。
 
 ### HTTP 调用示例
 
@@ -451,6 +475,7 @@ curl -s -X POST http://localhost:8000/rehearsals/$RID/locate \
 ```json
 {
   "id": "<排练 ID>",
+  "operation_id": "<定位操作 ID>",
   "elapsed_seconds": 2.0,
   "revision": 0,
   "origin": {"position": "4:1:0", "total_ticks": 5760,
@@ -473,6 +498,8 @@ curl -s -X POST http://localhost:8000/rehearsals/$RID/locate \
 }
 ```
 
+定位响应在原有字段之外新增 `operation_id`（其余字段均保持不变）。
+
 定位秒数不等于当前进度（或倒退领取）返回 **409** 且状态不变：
 
 ```bash
@@ -487,12 +514,71 @@ curl -i -X POST http://localhost:8000/rehearsals/$RID/locate \
 
 目标位置非法（如 `1:9:0`）或秒数为负/非有限值返回 **422**。
 
-#### 4）定位后继续领取：按“提交秒数 + 目标到提示时长”触发
+#### 3.1）撤销误定位：恢复定位前起点与该次跳过的提示
 
-同一秒（2.0 s）重复领取不发任何东西（没有位于目标 tick 上的提示）；
-“收尾”在新计时下触发于 4.0 s：
+如果定位后还**没有继续排练**（进度未前进、没有提示发放、未登记批注、
+速度图未发布），可取定位响应中的 `operation_id` 撤销：
 
 ```bash
+OPID=<上一步定位响应中的 operation_id>
+curl -s -X POST http://localhost:8000/rehearsals/$RID/locates/$OPID/undo
+```
+
+```json
+{
+  "id": "<排练 ID>",
+  "operation_id": "<定位操作 ID>",
+  "revision": 0,
+  "origin": {"position": "1:1:0", "total_ticks": 0,
+             "elapsed_seconds": 0.0},
+  "restored": [
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备",
+     "total_ticks": 3840}
+  ],
+  "cues": [
+    {"index": 0, "position": "2:1:0", "text": "进副歌", "total_ticks": 1920,
+     "status": "delivered", "delivered": true,
+     "trigger_seconds": 2.0, "revision": 0, "skipped_revision": null},
+    {"index": 1, "position": "3:1:0", "text": "渐慢准备", "total_ticks": 3840,
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null},
+    {"index": 2, "position": "5:1:0", "text": "收尾", "total_ticks": 7680,
+     "status": "pending", "delivered": false,
+     "trigger_seconds": null, "revision": null, "skipped_revision": null}
+  ]
+}
+```
+
+计时起点恢复为定位前的 `1:1:0 / 0.0s`；该次跳过的“渐慢准备”恢复
+**待发**（随后按恢复的起点与当前速度图定时，120 BPM 下重新在 4.0 s
+到点）；已发的“进副歌”保持已发，领取进度仍为 2.0 s。连续定位后再
+领取（如下面的步骤 4），该操作即过期：
+
+```bash
+# 撤销已撤销过的操作，或定位后已继续排练：
+curl -i -X POST http://localhost:8000/rehearsals/$RID/locates/$OPID/undo
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["path", "operation_id"],
+#   "msg": "该定位操作已撤销，不能重复撤销",
+#   "index": null, "operation_id": "...", "reason": "already_undone"}]}
+```
+
+`reason` 还可能是 `superseded`（之后又定位过，只能撤销最后一次）、
+`progress_advanced`（进度前进）、`cue_delivered`（有提示发放）、
+`annotation_registered`（已登记批注）或 `revision_published`
+（速度图已发布）；这些情况下状态均不改变。操作 ID 不存在返回 **404**。
+
+#### 4）定位后继续领取：按“提交秒数 + 目标到提示时长”触发
+
+重新定位到 `4:1:0`（上一小节若已撤销，需要重新定位；新操作会得到新的
+`operation_id`）。同一秒（2.0 s）重复领取不发任何东西（没有位于目标
+tick 上的提示）；“收尾”在新计时下触发于 4.0 s：
+
+```bash
+curl -s -X POST http://localhost:8000/rehearsals/$RID/locate \
+  -H 'Content-Type: application/json' \
+  -d '{"elapsed_seconds": 2.0, "position": "4:1:0"}' > /dev/null
+
 curl -s -X POST http://localhost:8000/rehearsals/$RID/claims \
   -H 'Content-Type: application/json' \
   -d '{"elapsed_seconds": 2.0}'
@@ -1103,6 +1189,24 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
   进度与定位起点不变），响应结构同上，仅 `msg` 为“批注秒数必须等于当前
   已领取进度……”。
 
+  撤销定位（`POST /rehearsals/{id}/locates/{operation_id}/undo`）在操作
+  **已撤销**（`already_undone`）、**已被后续定位覆盖**（`superseded`，
+  连续定位只能撤销最后一次），或定位后**进度前进**（`progress_advanced`）、
+  **提示发放**（`cue_delivered`）、**登记批注**（`annotation_registered`）、
+  **速度图发布**（`revision_published`）时返回 **409** 且状态完全不变：
+
+  ```json
+  {"detail": [{"loc": ["path", "operation_id"],
+               "msg": "定位之后领取进度已前进，不能撤销",
+               "index": null, "operation_id": "....",
+               "reason": "progress_advanced",
+               "elapsed_seconds": 3.0, "locate_elapsed_seconds": 2.0}]}
+  ```
+
+  撤销的操作 ID 不存在（或不属于该排练）返回 **404**
+  （`detail[0].loc` 指向 `path.operation_id`）；排练不存在仍指向
+  `path.rehearsal_id`。
+
 - **422**：提示位置非法或文字为空（带提示 `index`）、`elapsed_seconds`
   为负或非有限值、提示表为空；定位目标 `position` 非法（按谱例 PPQ/
   拍号校验）或定位秒数为负/非有限值；批注 `elapsed_seconds` 为负或
@@ -1146,6 +1250,17 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 保留、可继续领取；另含旧版 SQLite 库（无定位起点列）打开时自动迁移、
 旧排练仍按绝对秒数计时的验证。
 
+定位撤销测试（`tests/test_undo_locate.py`）覆盖：定位响应新增
+`operation_id` 且原有字段不变、撤销恢复定位前起点并把该次跳过的提示
+恢复为待发（已发不动、进度不回退）、恢复后待发提示按恢复起点与当前
+速度图定时、连续定位沿操作链逐级撤销、撤销后再定位可再次撤销、撤销
+普通回跳只恢复回跳前起点而不恢复更早的跳过、重复撤销/被后续定位覆盖
+**409** 且状态不变、定位后进度前进（含无发放的纯前进）/提示发放（含
+同秒发放目标处提示）/登记批注/速度图发布 **409**、同秒重复领取但无
+发放仍可撤销、操作 ID 不存在或属于其他排练 **404**、排练不存在 **404**、
+Store 重启（模拟 Compose 重启）后操作仍可撤销、过期判定仍生效，以及
+旧版 SQLite 库（无定位操作表）打开后自动建表且定位/撤销正常工作。
+
 批注测试（`tests/test_annotations.py`）覆盖：未定位时按乐谱起点反推、
 已领取进度映射到位置（且登记不推进进度、不发放提示）、秒数不等于
 进度 **409** 且不写入（落后/超前均拒绝）、秒数非有限/负与空白文字
@@ -1165,14 +1280,16 @@ Store 重启（模拟 Compose 重启）后批注保留、可继续登记且 seq 
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
 │   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
-│   └── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
-│                      #   排练/提示/发放/跳过记录/批注，单事务领取与定位
+│   ├── db.py          # SQLite 持久化：谱例/锚点/修订号乐观锁原子发布，
+│                      #   排练/提示/发放/跳过/定位操作历史/批注，单事务
+│                      #   领取、定位、撤销定位与批注
 ├── tests/
 │   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
 │   ├── test_api.py    # /convert 端到端测试
 │   ├── test_scores.py # 修订创建/预览/发布/查询与持久化测试
 │   ├── test_rehearsals.py # 排练创建/领取/定位跳过/并发与持久化测试
+│   ├── test_undo_locate.py # 定位撤销：起点/跳过恢复、过期 409、持久化
 │   └── test_annotations.py # 批注登记/位置反推/冻结/并发与持久化测试
 ├── Dockerfile
 ├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）

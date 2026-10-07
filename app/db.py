@@ -23,6 +23,10 @@
   非空文字、提交的累计秒数，以及登记瞬间按当前定位起点与当前已提交
   速度图反推并量化的乐谱位置/tick 与所用修订号——全部冻结，速度图
   发布或再次定位后保持登记时的值）。
+* ``locate_operations`` / ``locate_operation_skips``：定位操作历史与
+  每次定位当次跳过的提示下标。定位响应回带全局唯一操作 ID；撤销只
+  恢复对应操作保存的定位前起点并删除该次写入的跳过记录，连续定位时
+  只有最后一次未撤销定位可撤销。
 
 发布是单事务：``BEGIN IMMEDIATE`` 取得写锁后按 revision 做乐观并发控制
 （预期修订号不匹配 -> 409），成功则一次更新速度图、未锁定锚点秒数和
@@ -42,6 +46,18 @@
 速度图：待发提示按最新修订重算触发秒数，而定位起点（tick/累计秒数）、
 已发记录与跳过状态都保持不变。定位/领取/发布共用同一把写锁串行化，
 同一条提示不可能既跳过又发放。
+
+每次定位另在 ``locate_operations`` 落一条操作历史（全局唯一
+``operation_id`` 随定位响应回带，原有响应字段不变）：保存**定位前**的
+计时起点，以及定位瞬间的领取进度、已发提示数、批注数与谱例修订号；
+当次新跳过的提示下标记入 ``locate_operation_skips``。撤销
+（``undo_locate``）提交操作 ID，只允许撤销**最后一次未撤销定位**
+（之后又定位或已撤销 -> 409；ID 不存在 -> 404）；定位后只要进度前进、
+有提示发放、登记批注或速度图发布，同样 409 且状态不变。校验与恢复在
+单个 ``BEGIN IMMEDIATE`` 事务内基于同一已提交快照完成：只恢复该操作
+对应的定位前起点并删除该次写入的跳过记录（这些提示恢复待发，更早已
+发/跳过的提示不动），操作置为 ``undone``，进度不变；恢复后待发提示
+按恢复的起点与当前已提交速度图定时。
 
 批注登记（``add_annotation``）同样是单事务：提交的累计秒数必须
 **等于**已领取进度（否则 :class:`AnnotationProgressMismatch` -> 409，
@@ -145,6 +161,36 @@ CREATE TABLE IF NOT EXISTS rehearsal_annotations (
     PRIMARY KEY (rehearsal_id, seq),
     FOREIGN KEY (rehearsal_id) REFERENCES rehearsals(id) ON DELETE CASCADE
 );
+
+-- 每次定位落一条操作历史（含定位前的计时起点与定位瞬间的领取进度、
+-- 已发提示数、批注数、谱例修订号），定位响应回带全局唯一 operation_id；
+-- status 为 active 表示尚未撤销，撤销后置为 undone（历史保留）。
+CREATE TABLE IF NOT EXISTS locate_operations (
+    rehearsal_id        TEXT NOT NULL,
+    seq                 INTEGER NOT NULL,
+    operation_id        TEXT NOT NULL UNIQUE,
+    prev_origin_ticks   INTEGER NOT NULL,
+    prev_origin_elapsed REAL NOT NULL,
+    last_elapsed        REAL NOT NULL,
+    delivered_count     INTEGER NOT NULL,
+    annotation_count    INTEGER NOT NULL,
+    revision            INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (rehearsal_id, seq),
+    FOREIGN KEY (rehearsal_id) REFERENCES rehearsals(id) ON DELETE CASCADE
+);
+
+-- 每次定位“当次新跳过”的提示清单：撤销只删除该次定位写入的
+-- cue_skips 行（恢复这些提示为待发），更早定位跳过的提示保持原状。
+CREATE TABLE IF NOT EXISTS locate_operation_skips (
+    rehearsal_id TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    cue_index    INTEGER NOT NULL,
+    PRIMARY KEY (rehearsal_id, seq, cue_index),
+    FOREIGN KEY (rehearsal_id, seq)
+        REFERENCES locate_operations(rehearsal_id, seq) ON DELETE CASCADE
+);
 """
 
 
@@ -197,6 +243,37 @@ class AnnotationProgressMismatch(Exception):
         super().__init__(
             f"批注秒数必须等于当前已领取进度：提交 {elapsed}，"
             f"已领取到 {last_elapsed}"
+        )
+
+
+# 定位撤销失败原因（-> 409，状态不变）：
+# 已撤销 / 已被后续定位覆盖（连续定位只能撤销最后一次） /
+# 定位后进度前进 / 定位后有提示发放 / 定位后登记了批注 / 速度图已发布。
+UNDO_REASON_ALREADY_UNDONE = "already_undone"
+UNDO_REASON_SUPERSEDED = "superseded"
+UNDO_REASON_PROGRESS = "progress_advanced"
+UNDO_REASON_DELIVERY = "cue_delivered"
+UNDO_REASON_ANNOTATION = "annotation_registered"
+UNDO_REASON_REVISION = "revision_published"
+
+
+class LocateOperationNotFound(Exception):
+    """撤销提交的操作 ID 不存在（或不属于该排练）（-> 404）。"""
+
+
+class LocateUndoConflict(Exception):
+    """定位不可撤销：操作过期/已撤销，或定位后排练状态已前进（-> 409）。
+
+    ``reason`` 取本模块的 ``UNDO_REASON_*`` 常量；附加字段随原因不同
+    （如进度/修订号的期望值与当前值），用于 409 响应体。
+    """
+
+    def __init__(self, operation_id: str, reason: str, **extra: Any):
+        self.operation_id = operation_id
+        self.reason = reason
+        self.extra = extra
+        super().__init__(
+            f"定位操作 {operation_id} 不可撤销：{reason}"
         )
 
 
@@ -600,6 +677,12 @@ class Store:
         回调返回的下标被写入 ``cue_skips``（带定位时的修订号与提交秒数），
         随后以（目标 tick, elapsed）更新计时起点；``last_elapsed`` 不变。
         定位/领取/发布共用进程内写锁，同一条提示不可能既跳过又发放。
+
+        每次定位另写一条 ``locate_operations`` 历史：保存**定位前**的
+        计时起点（``prev_origin_*``）、定位瞬间的领取进度、已发提示数、
+        批注数与谱例修订号，并把当次跳过的提示下标记入
+        ``locate_operation_skips``；返回全局唯一 ``operation_id``，供
+        :meth:`undo_locate` 提交撤销。定位响应的原有字段全部保持不变。
         """
         with self._write_lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -638,6 +721,16 @@ class Store:
                     (rehearsal_id,),
                 ).fetchall()
             }
+            # 定位瞬间（定位前）的领取进度、已发数、批注数与修订号：
+            # 撤销时与当前状态逐一比对，任一前进则该操作过期（-> 409）。
+            delivered_count = len(delivered)
+            annotation_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM rehearsal_annotations "
+                    "WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchone()["n"]
+            )
             settled = delivered | skipped
             pending = [
                 {
@@ -678,15 +771,221 @@ class Store:
                 "WHERE id = ?",
                 (target_ticks, elapsed, rehearsal_id),
             )
+
+            # 写定位操作历史（撤销依据）：定位前起点 + 定位瞬间状态快照。
+            operation_id = new_id()
+            seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) AS next_seq "
+                "FROM locate_operations WHERE rehearsal_id = ?",
+                (rehearsal_id,),
+            ).fetchone()
+            op_seq = int(seq_row["next_seq"])
+            conn.execute(
+                "INSERT INTO locate_operations "
+                "(rehearsal_id, seq, operation_id, prev_origin_ticks, "
+                " prev_origin_elapsed, last_elapsed, delivered_count, "
+                " annotation_count, revision, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                (
+                    rehearsal_id,
+                    op_seq,
+                    operation_id,
+                    row["origin_ticks"],
+                    row["origin_elapsed"],
+                    elapsed,
+                    delivered_count,
+                    annotation_count,
+                    revision,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO locate_operation_skips "
+                "(rehearsal_id, seq, cue_index) VALUES (?, ?, ?)",
+                [(rehearsal_id, op_seq, cue_index) for cue_index in to_skip],
+            )
             conn.commit()
 
         rehearsal = self.get_rehearsal(rehearsal_id)
         return {
             "id": rehearsal_id,
+            "operation_id": operation_id,
             "elapsed_seconds": elapsed,
             "revision": revision,
             "skipped": sorted(to_skip_set),
             "rehearsal": rehearsal,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 定位撤销：恢复对应定位前的计时起点与该次跳过的提示（只撤销最后一次）
+    # ------------------------------------------------------------------ #
+    def undo_locate(self, rehearsal_id: str, operation_id: str) -> dict:
+        """单事务撤销一次尚未继续使用的最近定位。
+
+        只能撤销该操作：操作 ID 存在且属于本排练；状态为 ``active``；
+        且是当前**最后一次**未撤销定位（之后又定位过 ->
+        :class:`LocateUndoConflict`（``superseded``，-> 409））；操作 ID
+        已撤销同样 409（``already_undone``）；不存在/不属于本排练 ->
+        :class:`LocateOperationNotFound`（-> 404）。
+
+        定位后只要发生以下任一“继续使用”，该操作即过期，撤销返回 409
+        且**状态完全不变**（均在同一 ``BEGIN IMMEDIATE`` 快照内比对，
+        与领取/批注/定位/发布交错时取自同一已提交状态）：
+
+        * 领取进度前进（``last_elapsed`` 大于定位提交秒数）；
+        * 有提示被发放（已发数大于定位瞬间记录值）；
+        * 登记了批注（批注数大于定位瞬间记录值）；
+        * 谱例速度图已发布（当前修订号大于定位时修订号）。
+
+        校验通过后只恢复该操作对应的**定位前计时起点**，并删除**该次
+        定位写入的** ``cue_skips`` 行（这些提示恢复为待发；更早定位已
+        跳过/已发放的提示一律不动），随后把操作置为 ``undone``；
+        领取进度不变。撤销后待发提示自然按恢复的起点与谱例当前已提交
+        速度图定时（下一次领取时计算）。
+        """
+        with self._write_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            op = conn.execute(
+                "SELECT * FROM locate_operations "
+                "WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if op is None or op["rehearsal_id"] != rehearsal_id:
+                conn.rollback()
+                raise LocateOperationNotFound(operation_id)
+            rehearsal = conn.execute(
+                "SELECT * FROM rehearsals WHERE id = ?", (rehearsal_id,)
+            ).fetchone()
+            if rehearsal is None:  # 外键保证不会发生；防御性处理
+                conn.rollback()
+                raise RehearsalNotFound(rehearsal_id)
+
+            # 已撤销：409（幂等的再次撤销同样 409，状态不变）。
+            if op["status"] != "active":
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id, UNDO_REASON_ALREADY_UNDONE
+                )
+            # 连续定位只能撤销最后一次：存在更新的未撤销定位即过期。
+            newest = conn.execute(
+                "SELECT MAX(seq) AS max_seq FROM locate_operations "
+                "WHERE rehearsal_id = ? AND status = 'active'",
+                (rehearsal_id,),
+            ).fetchone()
+            if newest["max_seq"] is not None and newest["max_seq"] != op["seq"]:
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id, UNDO_REASON_SUPERSEDED
+                )
+
+            # “定位后继续使用”的各项检查，全部取自同一事务快照。
+            current_elapsed = rehearsal["last_elapsed"]
+            if current_elapsed > op["last_elapsed"]:
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id,
+                    UNDO_REASON_PROGRESS,
+                    elapsed_seconds=current_elapsed,
+                    locate_elapsed_seconds=op["last_elapsed"],
+                )
+            delivered_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM cue_deliveries "
+                    "WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchone()["n"]
+            )
+            if delivered_count > op["delivered_count"]:
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id,
+                    UNDO_REASON_DELIVERY,
+                    delivered_count=delivered_count,
+                    locate_delivered_count=op["delivered_count"],
+                )
+            annotation_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM rehearsal_annotations "
+                    "WHERE rehearsal_id = ?",
+                    (rehearsal_id,),
+                ).fetchone()["n"]
+            )
+            if annotation_count > op["annotation_count"]:
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id,
+                    UNDO_REASON_ANNOTATION,
+                    annotation_count=annotation_count,
+                    locate_annotation_count=op["annotation_count"],
+                )
+            score_row = conn.execute(
+                "SELECT * FROM scores WHERE id = ?", (rehearsal["score_id"],)
+            ).fetchone()
+            if score_row is None:  # 外键保证不会发生；防御性处理
+                conn.rollback()
+                raise ScoreNotFound(rehearsal["score_id"])
+            revision = score_row["revision"]
+            if revision > op["revision"]:
+                conn.rollback()
+                raise LocateUndoConflict(
+                    operation_id,
+                    UNDO_REASON_REVISION,
+                    revision=revision,
+                    locate_revision=op["revision"],
+                )
+
+            # 只删除“该次定位”写入的跳过记录，恢复这些提示为待发。
+            restored_rows = conn.execute(
+                "SELECT los.cue_index AS cue_index, rc.position AS position, "
+                "       rc.text AS text, rc.total_ticks AS total_ticks "
+                "FROM locate_operation_skips AS los "
+                "JOIN rehearsal_cues AS rc "
+                "  ON rc.rehearsal_id = los.rehearsal_id "
+                " AND rc.cue_index = los.cue_index "
+                "WHERE los.rehearsal_id = ? AND los.seq = ? "
+                "ORDER BY los.cue_index",
+                (rehearsal_id, op["seq"]),
+            ).fetchall()
+            conn.execute(
+                "DELETE FROM cue_skips WHERE rehearsal_id = ? "
+                "AND cue_index IN ("
+                "    SELECT cue_index FROM locate_operation_skips "
+                "    WHERE rehearsal_id = ? AND seq = ?)",
+                (rehearsal_id, rehearsal_id, op["seq"]),
+            )
+            # 恢复该次定位前的计时起点；领取进度不变。
+            conn.execute(
+                "UPDATE rehearsals SET origin_ticks = ?, origin_elapsed = ? "
+                "WHERE id = ?",
+                (
+                    op["prev_origin_ticks"],
+                    op["prev_origin_elapsed"],
+                    rehearsal_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE locate_operations SET status = 'undone' "
+                "WHERE rehearsal_id = ? AND seq = ?",
+                (rehearsal_id, op["seq"]),
+            )
+            conn.commit()
+
+        rehearsal_out = self.get_rehearsal(rehearsal_id)
+        return {
+            "id": rehearsal_id,
+            "operation_id": operation_id,
+            "revision": revision,
+            "restored_origin_ticks": op["prev_origin_ticks"],
+            "restored_origin_elapsed_seconds": op["prev_origin_elapsed"],
+            "restored": [
+                {
+                    "index": r["cue_index"],
+                    "position": r["position"],
+                    "text": r["text"],
+                    "total_ticks": r["total_ticks"],
+                }
+                for r in restored_rows
+            ],
+            "rehearsal": rehearsal_out,
         }
 
     # ------------------------------------------------------------------ #

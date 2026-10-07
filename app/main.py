@@ -16,11 +16,19 @@ from pydantic import BaseModel, ConfigDict, Field
 from .db import (
     AnnotationProgressMismatch,
     ElapsedRegression,
+    LocateOperationNotFound,
+    LocateUndoConflict,
     OriginMismatch,
     RehearsalNotFound,
     RevisionConflict,
     ScoreNotFound,
     Store,
+    UNDO_REASON_ALREADY_UNDONE,
+    UNDO_REASON_ANNOTATION,
+    UNDO_REASON_DELIVERY,
+    UNDO_REASON_PROGRESS,
+    UNDO_REASON_REVISION,
+    UNDO_REASON_SUPERSEDED,
 )
 from .tempo import TempoMap, TempoMapError, build_tempo_map
 
@@ -38,8 +46,12 @@ app = FastAPI(
         "还可在当前领取进度登记文字批注：提交累计秒数与非空文字，按当前"
         "定位起点与谱例当前已提交速度图反推并量化乐谱位置（tick 坐标及"
         "所用修订号随批注冻结），并按登记先后查询批注。"
+        "误定位后可凭定位响应中的操作 ID 撤销尚未继续使用的最近一次定位："
+        "只恢复该次定位前的计时起点与该次跳过的待发提示；定位后进度前进、"
+        "提示发放、登记批注或速度图发布，或操作已撤销/已被后续定位覆盖时"
+        "返回 409 且状态不变。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -270,6 +282,7 @@ async def root() -> dict:
         "scores": "/scores",
         "rehearsals": "/rehearsals",
         "annotations": "/rehearsals/{rehearsal_id}/annotations",
+        "undo_locate": "/rehearsals/{rehearsal_id}/locates/{operation_id}/undo",
     }
 
 
@@ -756,6 +769,13 @@ class SkippedCue(BaseModel):
 
 class LocateResponse(BaseModel):
     id: str
+    operation_id: str = Field(
+        ...,
+        description=(
+            "本次定位的操作 ID：可凭此撤销尚未继续使用的本次定位"
+            "（POST /rehearsals/{id}/locates/{operation_id}/undo）"
+        ),
+    )
     elapsed_seconds: float = Field(
         ..., description="本次定位提交并作为新计时起点的累计秒数"
     )
@@ -771,6 +791,32 @@ class LocateResponse(BaseModel):
         ),
     )
     cues: list[CueStatus] = Field(..., description="定位后的全部提示状态")
+
+
+class RestoredCue(BaseModel):
+    index: int
+    position: str
+    text: str
+    total_ticks: int
+
+
+class UndoLocateResponse(BaseModel):
+    id: str
+    operation_id: str = Field(..., description="本次撤销的定位操作 ID")
+    revision: int = Field(
+        ..., description="撤销时谱例当前已提交的速度图修订号（撤销不发布修订）"
+    )
+    origin: TimingOrigin = Field(
+        ..., description="恢复后的计时起点（该次定位之前的起点）"
+    )
+    restored: list[RestoredCue] = Field(
+        ...,
+        description=(
+            "恢复为待发的提示（该次定位新跳过的提示；更早定位已跳过或"
+            "已发放的提示不在其中，保持原状）"
+        ),
+    )
+    cues: list[CueStatus] = Field(..., description="撤销后的全部提示状态")
 
 
 RehearsalOut.model_rebuild()
@@ -884,6 +930,44 @@ def _annotation_progress_mismatch(exc: AnnotationProgressMismatch) -> JSONRespon
         "elapsed_seconds": exc.elapsed,
         "last_elapsed_seconds": exc.last_elapsed,
     }
+    return _error_response([detail], status_code=409)
+
+
+# 撤销失败原因 -> 中文说明（与 db.UNDO_REASON_* 一一对应）。
+_UNDO_REASON_MSG = {
+    UNDO_REASON_ALREADY_UNDONE: "该定位操作已撤销，不能重复撤销",
+    UNDO_REASON_SUPERSEDED: "连续定位时只能撤销最后一次未撤销定位",
+    UNDO_REASON_PROGRESS: "定位之后领取进度已前进，不能撤销",
+    UNDO_REASON_DELIVERY: "定位之后已有提示发放，不能撤销",
+    UNDO_REASON_ANNOTATION: "定位之后已登记批注，不能撤销",
+    UNDO_REASON_REVISION: "定位之后谱例速度图已发布，不能撤销",
+}
+
+
+def _undo_locate_not_found(operation_id: str) -> JSONResponse:
+    return _error_response(
+        [
+            {
+                "loc": ["path", "operation_id"],
+                "msg": f"定位操作 {operation_id} 不存在",
+                "index": None,
+                "operation_id": operation_id,
+            }
+        ],
+        status_code=404,
+    )
+
+
+def _undo_conflict(exc: LocateUndoConflict) -> JSONResponse:
+    # 操作过期/已撤销，或定位后排练状态已前进：409，状态完全不变。
+    detail = {
+        "loc": ["path", "operation_id"],
+        "msg": _UNDO_REASON_MSG.get(exc.reason, "该定位操作不可撤销"),
+        "index": None,
+        "operation_id": exc.operation_id,
+        "reason": exc.reason,
+    }
+    detail.update(exc.extra)
     return _error_response([detail], status_code=409)
 
 
@@ -1094,6 +1178,9 @@ async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
     目标之前的未发提示记为跳过（回跳不恢复、不重发）；计时起点更新为
     （提交秒数, 目标位置），此后提示触发秒数 = 提交秒数 + 速度图上
     目标到提示的时长。提交秒数必须等于当前领取进度，否则 409 状态不变。
+
+    响应在原有字段之外新增 ``operation_id``（其余字段保持不变）：
+    误定位后可凭它撤销尚未继续使用的本次定位。
     """
     elapsed = req.elapsed_seconds
     if not (
@@ -1156,11 +1243,58 @@ async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
     origin = _rehearsal_out(score, result["rehearsal"]).origin
     return LocateResponse(
         id=rehearsal_id,
+        operation_id=result["operation_id"],
         elapsed_seconds=elapsed_value,
         revision=result["revision"],
         origin=origin,
         skipped=skipped,
         cues=result["rehearsal"]["cues"],
+    )
+
+
+@app.post(
+    "/rehearsals/{rehearsal_id}/locates/{operation_id}/undo",
+    response_model=UndoLocateResponse,
+)
+async def undo_locate_rehearsal(rehearsal_id: str, operation_id: str):
+    """撤销尚未继续使用的最近一次定位（普通回跳不由此接口恢复旧提示）。
+
+    提交定位响应中的操作 ID：只允许撤销该排练**最后一次未撤销定位**；
+    操作已撤销或已被后续定位覆盖，或定位后进度前进、提示发放、登记
+    批注、速度图发布，均返回 409 且状态不变；操作 ID 不存在返回 404。
+
+    成功后只恢复该次定位**之前的计时起点**与**该次跳过**的提示为待发
+    （更早已发/跳过的提示保持原状，领取进度不变）。ID 匹配、状态检查与
+    提示恢复在单个写事务内基于同一已提交状态完成；待发提示随后按恢复
+    的起点与谱例当前已提交速度图定时，查询与重启后的状态一致。
+    """
+    try:
+        # 排练不存在优先返回 404（与领取/定位/查询一致），随后才匹配操作 ID。
+        store.get_rehearsal(rehearsal_id)
+        result = store.undo_locate(rehearsal_id, operation_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    except LocateOperationNotFound:
+        return _undo_locate_not_found(operation_id)
+    except LocateUndoConflict as exc:
+        return _undo_conflict(exc)
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+
+    rehearsal = result["rehearsal"]
+    # 恢复后起点的位置字符串用谱例当前已提交速度图（仅取 PPQ/拍号）规范。
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+    origin = _rehearsal_out(score, rehearsal).origin
+    return UndoLocateResponse(
+        id=rehearsal_id,
+        operation_id=operation_id,
+        revision=result["revision"],
+        origin=origin,
+        restored=result["restored"],
+        cues=rehearsal["cues"],
     )
 
 
