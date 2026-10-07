@@ -21,6 +21,7 @@ from .db import (
     RevisionConflict,
     ScoreNotFound,
     Store,
+    UndoNotAllowed,
 )
 from .tempo import TempoMap, TempoMapError, build_tempo_map
 
@@ -37,9 +38,13 @@ app = FastAPI(
         "提示记为跳过，此后提示按目标到提示的速度图时长相对该累计秒数定时。"
         "还可在当前领取进度登记文字批注：提交累计秒数与非空文字，按当前"
         "定位起点与谱例当前已提交速度图反推并量化乐谱位置（tick 坐标及"
-        "所用修订号随批注冻结），并按登记先后查询批注。"
+        "所用修订号随批注冻结），并按登记先后查询批注。误定位后、尚未"
+        "继续使用时，可凭定位响应返回的操作 ID 撤销最近一次定位：恢复"
+        "该次定位保存的原计时起点与当次跳过的待发提示；操作已撤销/过期"
+        "（连续定位只能撤销最后一次）或定位后进度前进、提示发放、登记"
+        "批注、速度图发布时返回 409 且状态不变。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 # SQLite 持久化（默认 ./data/tempo.db，可用 TEMPO_DB_PATH 覆盖；
@@ -270,6 +275,7 @@ async def root() -> dict:
         "scores": "/scores",
         "rehearsals": "/rehearsals",
         "annotations": "/rehearsals/{rehearsal_id}/annotations",
+        "undo_locate": "/rehearsals/{rehearsal_id}/locate/{operation_id}/undo",
     }
 
 
@@ -680,9 +686,17 @@ class RehearsalOut(BaseModel):
     origin: "TimingOrigin" = Field(
         ...,
         description=(
-            "当前计时起点：每次定位更新（未定位时为 1:1:0 / 0.0s）；"
+            "当前计时起点：每次定位更新（未定位时为 1:1:0 / 0.0s），"
+            "撤销最近一次定位后恢复为该次定位保存的原起点；"
             "后续提示触发秒数 = origin_elapsed_seconds + "
             "速度图上 origin 位置到提示位置的时长"
+        ),
+    )
+    undoable_operation_id: Optional[str] = Field(
+        None,
+        description=(
+            "最近一次定位的操作 ID（可凭它撤销该定位）；没有可撤销定位"
+            "（从未定位、已撤销或已被后续定位/发布/进度前进等作废）时为 null"
         ),
     )
     cues: list[CueStatus]
@@ -756,6 +770,13 @@ class SkippedCue(BaseModel):
 
 class LocateResponse(BaseModel):
     id: str
+    operation_id: str = Field(
+        ...,
+        description=(
+            "本次定位的操作 ID；误定位后可凭它调用撤销接口"
+            "（POST /rehearsals/{id}/locate/{operation_id}/undo）"
+        ),
+    )
     elapsed_seconds: float = Field(
         ..., description="本次定位提交并作为新计时起点的累计秒数"
     )
@@ -771,6 +792,38 @@ class LocateResponse(BaseModel):
         ),
     )
     cues: list[CueStatus] = Field(..., description="定位后的全部提示状态")
+
+
+class RestoredCue(BaseModel):
+    index: int
+    position: str
+    text: str
+    total_ticks: int = Field(
+        ..., description="恢复待发的提示位置 tick 坐标（即该次定位曾跳过的提示）"
+    )
+
+
+class UndoLocateResponse(BaseModel):
+    id: str
+    operation_id: str = Field(..., description="被撤销定位的操作 ID")
+    revision: int = Field(
+        ...,
+        description=(
+            "撤销检查所基于的速度图修订号（与定位瞬间一致；定位后发布"
+            "新速度图则撤销请求返回 409）"
+        ),
+    )
+    origin: TimingOrigin = Field(
+        ..., description="恢复后的计时起点（该次定位保存的原起点）"
+    )
+    restored: list[RestoredCue] = Field(
+        ...,
+        description=(
+            "本次恢复为待发的提示（该次定位跳过的提示；更早已发或跳过"
+            "的提示保持原状，不在其中）"
+        ),
+    )
+    cues: list[CueStatus] = Field(..., description="撤销后的全部提示状态")
 
 
 RehearsalOut.model_rebuild()
@@ -992,6 +1045,7 @@ def _rehearsal_out(score: dict, rehearsal: dict) -> RehearsalOut:
                 "total_ticks": origin_ticks,
                 "elapsed_seconds": rehearsal.get("origin_elapsed_seconds", 0.0),
             },
+            "undoable_operation_id": rehearsal.get("undoable_operation_id"),
             "cues": rehearsal["cues"],
         }
     )
@@ -1156,10 +1210,88 @@ async def locate_rehearsal(rehearsal_id: str, req: LocateRequest):
     origin = _rehearsal_out(score, result["rehearsal"]).origin
     return LocateResponse(
         id=rehearsal_id,
+        operation_id=result["operation_id"],
         elapsed_seconds=elapsed_value,
         revision=result["revision"],
         origin=origin,
         skipped=skipped,
+        cues=result["rehearsal"]["cues"],
+    )
+
+
+# 撤销被拒绝的原因 -> 中文说明（均为 409，且不改变任何状态）。
+_UNDO_REASON_MSGS = {
+    "not_found": "定位操作不存在或不属于该排练",
+    "already_undone": "该定位操作已撤销，不能重复撤销",
+    "superseded": "连续定位后只能撤销最后一次定位（该操作已被后续定位取代）",
+    "progress": "定位后领取进度已前进（或已有提示发放），不能撤销",
+    "annotation": "定位后已登记批注，不能撤销",
+    "revision": "定位后速度图已发布（谱例修订号已前进），不能撤销",
+}
+
+
+def _undo_not_allowed(exc: UndoNotAllowed) -> JSONResponse:
+    # 操作 ID 过期/已撤销，或定位后进度前进、提示发放、登记批注、
+    # 速度图发布：409，状态完全不变。
+    detail = {
+        "loc": ["path", "operation_id"],
+        "msg": (
+            f"定位操作 {exc.operation_id} 不可撤销："
+            f"{_UNDO_REASON_MSGS.get(exc.reason, exc.reason)}"
+        ),
+        "index": None,
+        "operation_id": exc.operation_id,
+        "reason": exc.reason,
+    }
+    return _error_response([detail], status_code=409)
+
+
+@app.post(
+    "/rehearsals/{rehearsal_id}/locate/{operation_id}/undo",
+    response_model=UndoLocateResponse,
+)
+async def undo_rehearsal_locate(rehearsal_id: str, operation_id: str):
+    """撤销最近一次定位（误定位后、尚未继续使用时）。
+
+    提交定位响应返回的操作 ID：在单个写事务内匹配该操作、检查其仍为
+    最近一次可撤销定位且定位后进度未前进、无提示发放、无批注登记、
+    速度图未发布，随后把计时起点恢复为该次定位保存的原起点，并把该次
+    定位跳过的提示恢复为待发（更早已发或跳过的提示保持原状）。任一
+    条件不满足返回 409 且状态不变；排练不存在返回 404。
+    """
+    try:
+        rehearsal = store.get_rehearsal(rehearsal_id)
+    except RehearsalNotFound:
+        return _rehearsal_not_found(rehearsal_id)
+    try:
+        score = store.get_score(rehearsal["score_id"])
+    except ScoreNotFound:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(rehearsal["score_id"])
+
+    try:
+        result = store.undo_locate(rehearsal_id, operation_id)
+    except UndoNotAllowed as exc:
+        return _undo_not_allowed(exc)
+    except ScoreNotFound as exc:  # 防御性：谱例被删（正常不会发生）
+        return _not_found(str(exc))
+
+    by_index = {c["index"]: c for c in result["rehearsal"]["cues"]}
+    restored = [
+        RestoredCue(
+            index=cue_index,
+            position=by_index[cue_index]["position"],
+            text=by_index[cue_index]["text"],
+            total_ticks=by_index[cue_index]["total_ticks"],
+        )
+        for cue_index in result["restored"]
+    ]
+    origin = _rehearsal_out(score, result["rehearsal"]).origin
+    return UndoLocateResponse(
+        id=rehearsal_id,
+        operation_id=operation_id,
+        revision=result["revision"],
+        origin=origin,
+        restored=restored,
         cues=result["rehearsal"]["cues"],
     )
 
